@@ -6962,7 +6962,7 @@ do
 		    end
 		end)
 		
-		print("Chat v16 loaded - RightShift toggles the UI, use the menu button for settings.")
+	
 		
 		local LastActiveMode = "idle"
 		function ChatApi.SetEnabled(state)
