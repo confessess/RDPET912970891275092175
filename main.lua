@@ -5099,4 +5099,1902 @@ do
 	end
 
 	v10:Button({ Title = "Copy Discord Link", Callback = fn7 })
-end 
+end
+
+-- Chat Room tab (chat window is hidden + inactive until the toggle is on)
+do
+	local function CreateChatRoom()
+		
+		
+		--// CONFIG  (get these from your deployed Cloudflare Worker)
+		local WORKER_URL = "https://lo-chat.chatroomglobal.workers.dev"
+		local CHAT_KEY = "a987d6na97826dn78a26dna796da97n6da96wd978wa6ndw98a76da8n7dan6daw87d6dn87aw6da8"
+		local MAX_MESSAGES = 100 -- messages kept on screen
+		local DEFAULT_BACKGROUND_ID = "" -- optional: default chat background (image asset ID). Players can also set their own in Settings.
+		
+		--// Spam block + filter config
+		local SEND_COOLDOWN = 1          -- seconds between messages (1 message per second)
+		local MAX_MESSAGE_LENGTH = 200   -- longer messages are cut off
+		local MAX_REPEAT_RUN = 4         -- "heyyyyyyy" becomes "heyyyy"
+		local DUPLICATE_WINDOW = 15      -- seconds: sending the exact same message again is blocked
+		local FILTER_INCOMING = true     -- also mask blocked words in messages you receive
+		
+		-- Whole words (also matches common endings like s / ed / er / ing, and leetspeak like sh1t).
+		-- Add whatever you want blocked here (lowercase).
+		local BLOCKED_WORDS = {
+		    "nigger", "faggot", "coon", "whore", "slut",
+		}
+		
+		-- Phrases matched anywhere in the text (scam / invite spam).
+		local BLOCKED_PHRASES = {
+		    "discord.gg/", "discord.com/invite", "free robux", "robux generator",
+		}
+		local USERNAME = game:GetService("Players").LocalPlayer.Name
+		
+		--// Polling config
+		local POLL_IDLE = 60
+		local POLL_ACTIVE = 15
+		local POLL_BURST = 5
+		local ACTIVE_DURATION = 120
+		
+		--// Services
+		local Players = game:GetService("Players")
+		local UserInputService = game:GetService("UserInputService")
+		local HttpService = game:GetService("HttpService")
+		local TweenService = game:GetService("TweenService")
+		local ContentProvider = game:GetService("ContentProvider")
+		local LocalPlayer = Players.LocalPlayer
+		
+		--// Theme
+		local Theme = {
+		    Bg = Color3.fromRGB(13, 15, 21),
+		    Surface = Color3.fromRGB(21, 24, 33),
+		    SurfaceHi = Color3.fromRGB(30, 34, 46),
+		    Border = Color3.fromRGB(42, 47, 63),
+		    Accent = Color3.fromRGB(99, 102, 241),
+		    AccentHi = Color3.fromRGB(119, 122, 255),
+		    AccentSoft = Color3.fromRGB(165, 180, 252),
+		    Text = Color3.fromRGB(236, 239, 247),
+		    TextDim = Color3.fromRGB(148, 155, 175),
+		    TextFaint = Color3.fromRGB(98, 105, 128),
+		    Green = Color3.fromRGB(74, 222, 128),
+		    Blue = Color3.fromRGB(96, 165, 250),
+		    Red = Color3.fromRGB(248, 113, 113),
+		    Amber = Color3.fromRGB(251, 191, 36),
+		    Gray = Color3.fromRGB(148, 155, 175),
+		}
+		
+		--// Universal Request
+		local RequestFunc = nil
+		
+		local function DetectRequest()
+		    local options = {
+		        {func = syn and syn.request},
+		        {func = http_request},
+		        {func = request},
+		        {func = fluxus and fluxus.request},
+		        {func = krnl and krnl.request},
+		        {func = potassium and potassium.request},
+		    }
+		    for _, opt in ipairs(options) do
+		        if opt.func and type(opt.func) == "function" then
+		            RequestFunc = opt.func
+		            return true
+		        end
+		    end
+		    return false
+		end
+		
+		local function DoRequest(options)
+		    if RequestFunc then
+		        local success, result = pcall(function()
+		            return RequestFunc(options)
+		        end)
+		        if success then return result end
+		    end
+		    local success, result = pcall(function()
+		        if options.Method == "POST" then
+		            return HttpService:PostAsync(options.Url, options.Body, Enum.HttpContentType.ApplicationJson, false, options.Headers)
+		        else
+		            return HttpService:GetAsync(options.Url, true, options.Headers)
+		        end
+		    end)
+		    return {Body = success and result or nil, StatusCode = success and 200 or 0}
+		end
+		
+		--// API helpers (Cloudflare Worker + D1)
+		local function ApiHeaders()
+		    return {
+		        ["Content-Type"] = "application/json",
+		        ["X-Chat-Key"] = CHAT_KEY,
+		    }
+		end
+		
+		local function DecodeBody(response)
+		    if response and response.Body then
+		        local ok, data = pcall(function()
+		            return HttpService:JSONDecode(response.Body)
+		        end)
+		        if ok and type(data) == "table" then
+		            return data
+		        end
+		    end
+		    return nil
+		end
+		
+		-- Returns a list of messages (may be empty) or nil on failure.
+		-- afterId = 0 loads recent history; otherwise only messages newer than afterId come back.
+		local function FetchMessages(afterId)
+		    local response = DoRequest({
+		        Url = WORKER_URL .. "/messages?after=" .. tostring(afterId or 0),
+		        Method = "GET",
+		        Headers = ApiHeaders(),
+		    })
+		    if response and (response.StatusCode == nil or response.StatusCode == 200) then
+		        local data = DecodeBody(response)
+		        if data and type(data.messages) == "table" then
+		            return data.messages
+		        end
+		    end
+		    return nil
+		end
+		
+		-- Returns the saved result ({ok, id, timestamp}) or nil plus the HTTP status code.
+		local function PostMessage(text)
+		    local response = DoRequest({
+		        Url = WORKER_URL .. "/send",
+		        Method = "POST",
+		        Headers = ApiHeaders(),
+		        Body = HttpService:JSONEncode({
+		            username = USERNAME,
+		            message = text,
+		            game = game.PlaceId,
+		            jobId = game.JobId,
+		            userId = LocalPlayer.UserId,
+		        }),
+		    })
+		    local status = response and response.StatusCode or 0
+		    if response and status == 200 then
+		        local data = DecodeBody(response)
+		        if data and data.ok then
+		            return data, status
+		        end
+		    end
+		    return nil, status
+		end
+		
+		--// State
+		local ChatHistory = {}
+		local LastMessageId = 0 -- polling cursor: highest message id we've seen
+		local LastSendTime = tick()
+		local LastActivityTime = tick()
+		local LastPollTime = 0
+		local IsSending = false
+		local CurrentPollInterval = POLL_IDLE
+		local RequestCount = 0
+		local ForcePoll = false
+		local PollGen = 0
+		local MIN_POLL_GAP = 3
+		local ManualMode = "idle"
+		local visible = false
+		
+		--// UI helpers
+		local function New(class, props, parent)
+		    local inst = Instance.new(class)
+		    for k, v in pairs(props or {}) do
+		        inst[k] = v
+		    end
+		    if parent then inst.Parent = parent end
+		    return inst
+		end
+		
+		local function Round(inst, radius)
+		    return New("UICorner", {CornerRadius = UDim.new(0, radius)}, inst)
+		end
+		
+		local function Stroke(inst, color, transparency, thickness)
+		    return New("UIStroke", {
+		        Color = color,
+		        Transparency = transparency or 0,
+		        Thickness = thickness or 1,
+		        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		    }, inst)
+		end
+		
+		local function Pad(inst, t, r, b, l)
+		    return New("UIPadding", {
+		        PaddingTop = UDim.new(0, t),
+		        PaddingRight = UDim.new(0, r),
+		        PaddingBottom = UDim.new(0, b),
+		        PaddingLeft = UDim.new(0, l),
+		    }, inst)
+		end
+		
+		local function Tween(inst, props, t, style, dir)
+		    TweenService:Create(
+		        inst,
+		        TweenInfo.new(t or 0.15, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out),
+		        props
+		    ):Play()
+		end
+		
+		-- Drag any handle to move a target. onClick fires for a press without movement,
+		-- onEnd fires after a real drag.
+		local function MakeDraggable(handle, target, onClick, onEnd)
+		    local dragging, moved = false, false
+		    local dragStart, startPos
+		
+		    handle.InputBegan:Connect(function(input)
+		        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		            dragging = true
+		            moved = false
+		            dragStart = input.Position
+		            startPos = target.Position
+		            input.Changed:Connect(function()
+		                if input.UserInputState == Enum.UserInputState.End then
+		                    dragging = false
+		                    if moved then
+		                        if onEnd then onEnd() end
+		                    elseif onClick then
+		                        onClick()
+		                    end
+		                end
+		            end)
+		        end
+		    end)
+		
+		    UserInputService.InputChanged:Connect(function(input)
+		        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		            local d = input.Position - dragStart
+		            if d.Magnitude > 4 then moved = true end
+		            if moved then
+		                target.Position = UDim2.new(
+		                    startPos.X.Scale, startPos.X.Offset + d.X,
+		                    startPos.Y.Scale, startPos.Y.Offset + d.Y
+		                )
+		            end
+		        end
+		    end)
+		end
+		
+		-- Link helpers
+		local function EscapeRich(str)
+		    return (str:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&apos;"))
+		end
+		
+		local function FindLink(text, pos)
+		    local s1, e1 = text:find("https?://%S+", pos)
+		    local s2, e2 = text:find("www%.[%w%-]+%.%S+", pos)
+		    local st, en
+		    if s1 and (not s2 or s1 <= s2) then
+		        st, en = s1, e1
+		    else
+		        st, en = s2, e2
+		    end
+		    if not st then return nil end
+		    local url = text:sub(st, en)
+		    local trimmed = url:gsub("[%.,;:!%?%)%]'\"]+$", "")
+		    return st, st + #trimmed - 1
+		end
+		
+		-- Returns rich-text string (links colored + underlined) and the list of raw links
+		local function BuildRich(text, isLocal)
+		    local out, links, pos = {}, {}, 1
+		    local color = isLocal and "#e6e9ff" or "#8fa3ff"
+		    while true do
+		        local st, en = FindLink(text, pos)
+		        if not st then break end
+		        table.insert(out, EscapeRich(text:sub(pos, st - 1)))
+		        local url = text:sub(st, en)
+		        table.insert(out, '<font color="' .. color .. '"><u>' .. EscapeRich(url) .. '</u></font>')
+		        table.insert(links, url)
+		        pos = en + 1
+		    end
+		    table.insert(out, EscapeRich(text:sub(pos)))
+		    return table.concat(out), links
+		end
+		
+		local function ShortenUrl(url)
+		    local short = url:gsub("^https?://", "")
+		    short = short:gsub("^www%.", "")
+		    if #short > 34 then short = short:sub(1, 31) .. "..." end
+		    return short
+		end
+		
+		local function CopyLink(url, btn)
+		    local full = url
+		    if full:lower():sub(1, 4) == "www." then full = "https://" .. full end
+		    local clip = setclipboard or toclipboard or (syn and syn.write_clipboard)
+		    local original = btn.Text
+		    local ok = clip and pcall(clip, full)
+		    btn.Text = ok and "Copied to clipboard" or "Clipboard not supported"
+		    task.delay(1.5, function()
+		        if btn.Parent then btn.Text = original end
+		    end)
+		end
+		
+		-- UI state shared by the toggle / minimize logic (functions are assigned further down)
+		local minimized = false
+		local ShowUI, HideUI, ToggleUI, SetMinimized, SetSettingsOpen
+		local ChatApi = {}
+		
+		-- Polling is only allowed while the UI is shown AND expanded
+		local function CanPoll()
+		    return visible and not minimized
+		end
+		
+		--// Window settings (size and position are remembered between runs)
+		local HEADER_H = 52
+		local DEFAULT_W, DEFAULT_H = 380, 500
+		local MIN_W, MIN_HGT = 320, 300
+		local MAX_W, MAX_HGT = 720, 900
+		local SETTINGS_FILE = "LOChat_settings.json"
+		local GROUP_WINDOW = 300 -- seconds: same-sender messages within this window are grouped
+		
+		local function ClampNum(v, lo, hi, default)
+		    if type(v) ~= "number" then return default end
+		    return math.max(lo, math.min(hi, v))
+		end
+		
+		local function LoadSettings()
+		    local ok, data = pcall(function()
+		        if isfile and readfile and isfile(SETTINGS_FILE) then
+		            return HttpService:JSONDecode(readfile(SETTINGS_FILE))
+		        end
+		        return nil
+		    end)
+		    if ok and type(data) == "table" then return data end
+		    return {}
+		end
+		
+		local saved = LoadSettings()
+		local FullW = ClampNum(saved.w, MIN_W, MAX_W, DEFAULT_W)
+		local FullH = ClampNum(saved.h, MIN_HGT, MAX_HGT, DEFAULT_H)
+		local BgId = type(saved.bg) == "string" and saved.bg or ""
+		if BgId == "" then BgId = DEFAULT_BACKGROUND_ID end
+		local BgDim = ClampNum(saved.dim, 0, 0.95, 0.6)
+		
+		local function DefaultPosition()
+		    return UDim2.new(0, 24, 0.5, -math.floor(DEFAULT_H / 2))
+		end
+		
+		--// GUI
+		local sg = New("ScreenGui", {
+		    Name = "ChatApp",
+		    ResetOnSpawn = false,
+		    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		}, LocalPlayer:WaitForChild("PlayerGui"))
+		
+		local startPos = DefaultPosition()
+		if type(saved.xs) == "number" and type(saved.xo) == "number"
+		    and type(saved.ys) == "number" and type(saved.yo) == "number" then
+		    startPos = UDim2.new(saved.xs, saved.xo, saved.ys, saved.yo)
+		end
+		
+		local frame = New("CanvasGroup", {
+		    Name = "Main",
+		    Size = UDim2.new(0, FullW, 0, FullH),
+		    Position = startPos,
+		    BackgroundColor3 = Theme.Bg,
+		    BorderSizePixel = 0,
+		    GroupTransparency = 1,
+		}, sg)
+		Round(frame, 14)
+		local frameStroke = Stroke(frame, Theme.Border, 1, 1)
+		local frameScale = New("UIScale", {Scale = 0.95}, frame)
+		
+		local function SaveSettings()
+		    if not writefile then return end
+		    local pos = frame.Position
+		    pcall(function()
+		        writefile(SETTINGS_FILE, HttpService:JSONEncode({
+		            w = FullW, h = FullH,
+		            xs = pos.X.Scale, xo = pos.X.Offset,
+		            ys = pos.Y.Scale, yo = pos.Y.Offset,
+		            bg = BgId, dim = BgDim,
+		        }))
+		    end)
+		end
+		
+		-- Header ---------------------------------------------------------------
+		local topBar = New("Frame", {
+		    Name = "TopBar",
+		    Size = UDim2.new(1, 0, 0, HEADER_H),
+		    BackgroundTransparency = 1,
+		    Active = true,
+		}, frame)
+		
+		local roomBadge = New("TextLabel", {
+		    Size = UDim2.new(0, 34, 0, 34),
+		    Position = UDim2.new(0, 14, 0, 9),
+		    BackgroundColor3 = Theme.Accent,
+		    Text = "#",
+		    TextColor3 = Color3.new(1, 1, 1),
+		    TextSize = 20,
+		    Font = Enum.Font.GothamBold,
+		    BorderSizePixel = 0,
+		}, topBar)
+		Round(roomBadge, 10)
+		
+		-- status dot sits on the badge corner like an online indicator
+		local statusDot = New("Frame", {
+		    Size = UDim2.new(0, 12, 0, 12),
+		    Position = UDim2.new(0, 36, 0, 31),
+		    BackgroundColor3 = Theme.Gray,
+		    BorderSizePixel = 0,
+		}, topBar)
+		Round(statusDot, 6)
+		Stroke(statusDot, Theme.Bg, 0, 2)
+		
+		New("TextLabel", {
+		    Size = UDim2.new(1, -172, 0, 20),
+		    Position = UDim2.new(0, 56, 0, 8),
+		    BackgroundTransparency = 1,
+		    Text = "Global Chat",
+		    TextColor3 = Theme.Text,
+		    TextSize = 16,
+		    Font = Enum.Font.GothamBold,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		}, topBar)
+		
+		local statusLabel = New("TextLabel", {
+		    Size = UDim2.new(1, -172, 0, 14),
+		    Position = UDim2.new(0, 56, 0, 28),
+		    BackgroundTransparency = 1,
+		    Text = "Idle",
+		    TextColor3 = Theme.TextDim,
+		    TextSize = 11,
+		    Font = Enum.Font.Gotham,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		    TextTruncate = Enum.TextTruncate.AtEnd,
+		}, topBar)
+		
+		New("Frame", {
+		    Size = UDim2.new(1, -24, 0, 1),
+		    Position = UDim2.new(0, 12, 0, HEADER_H - 1),
+		    BackgroundColor3 = Theme.Border,
+		    BackgroundTransparency = 0.5,
+		    BorderSizePixel = 0,
+		}, topBar)
+		
+		-- Icon buttons are drawn from shapes so they never render as font boxes
+		local function IconButton(xOffset)
+		    local b = New("TextButton", {
+		        Size = UDim2.new(0, 28, 0, 28),
+		        Position = UDim2.new(1, xOffset, 0, 12),
+		        BackgroundColor3 = Theme.Surface,
+		        Text = "",
+		        AutoButtonColor = false,
+		        BorderSizePixel = 0,
+		    }, topBar)
+		    Round(b, 8)
+		    return b
+		end
+		
+		local function Bar(parent, w, h, rot, ox, oy)
+		    local bar = New("Frame", {
+		        Size = UDim2.new(0, w, 0, h),
+		        AnchorPoint = Vector2.new(0.5, 0.5),
+		        Position = UDim2.new(0.5, ox or 0, 0.5, oy or 0),
+		        Rotation = rot or 0,
+		        BackgroundColor3 = Theme.TextDim,
+		        BorderSizePixel = 0,
+		    }, parent)
+		    Round(bar, 1)
+		    return bar
+		end
+		
+		-- Settings button (three bars)
+		local gearBtn = IconButton(-108)
+		local gearBars = {Bar(gearBtn, 12, 2, 0, 0, -4), Bar(gearBtn, 12, 2, 0, 0, 0), Bar(gearBtn, 12, 2, 0, 0, 4)}
+		
+		-- Minimize button (bar, with a vertical bar fading in to make a "+" when minimized)
+		local minBtn = IconButton(-74)
+		Bar(minBtn, 12, 2)
+		local minBarV = Bar(minBtn, 2, 12)
+		minBarV.BackgroundTransparency = 1
+		
+		-- Close button (X)
+		local closeBtn = IconButton(-40)
+		local closeBars = {Bar(closeBtn, 14, 2, 45), Bar(closeBtn, 14, 2, -45)}
+		
+		local SettingsOpen = false
+		
+		gearBtn.MouseEnter:Connect(function()
+		    Tween(gearBtn, {BackgroundColor3 = Theme.SurfaceHi})
+		end)
+		gearBtn.MouseLeave:Connect(function()
+		    Tween(gearBtn, {BackgroundColor3 = SettingsOpen and Theme.SurfaceHi or Theme.Surface})
+		end)
+		minBtn.MouseEnter:Connect(function()
+		    Tween(minBtn, {BackgroundColor3 = Theme.SurfaceHi})
+		end)
+		minBtn.MouseLeave:Connect(function()
+		    Tween(minBtn, {BackgroundColor3 = Theme.Surface})
+		end)
+		closeBtn.MouseEnter:Connect(function()
+		    Tween(closeBtn, {BackgroundColor3 = Theme.Red})
+		    for _, b in ipairs(closeBars) do Tween(b, {BackgroundColor3 = Color3.new(1, 1, 1)}) end
+		end)
+		closeBtn.MouseLeave:Connect(function()
+		    Tween(closeBtn, {BackgroundColor3 = Theme.Surface})
+		    for _, b in ipairs(closeBars) do Tween(b, {BackgroundColor3 = Theme.TextDim}) end
+		end)
+		
+		gearBtn.MouseButton1Click:Connect(function()
+		    SetSettingsOpen(not SettingsOpen)
+		end)
+		minBtn.MouseButton1Click:Connect(function()
+		    SetMinimized(not minimized)
+		end)
+		closeBtn.MouseButton1Click:Connect(function()
+		    ChatApi.SetEnabled(false)
+		end)
+		
+		MakeDraggable(topBar, frame, nil, SaveSettings)
+		
+		-- Body (fixed pixel height so minimizing never reflows it) -----------------
+		local body = New("Frame", {
+		    Name = "Body",
+		    Size = UDim2.new(1, 0, 0, FullH - HEADER_H),
+		    Position = UDim2.new(0, 0, 0, HEADER_H),
+		    BackgroundTransparency = 1,
+		    BorderSizePixel = 0,
+		}, frame)
+		
+		local function ApplySize()
+		    body.Size = UDim2.new(1, 0, 0, FullH - HEADER_H)
+		    frame.Size = UDim2.new(0, FullW, 0, minimized and HEADER_H or FullH)
+		end
+		
+		local function ResetWindow()
+		    FullW, FullH = DEFAULT_W, DEFAULT_H
+		    frame.Position = DefaultPosition()
+		    ApplySize()
+		    SaveSettings()
+		end
+		
+		-- Chat area
+		local chatBg = New("Frame", {
+		    Size = UDim2.new(1, -20, 1, -70),
+		    Position = UDim2.new(0, 10, 0, 4),
+		    BackgroundColor3 = Theme.Surface,
+		    BorderSizePixel = 0,
+		    ClipsDescendants = true,
+		}, body)
+		Round(chatBg, 12)
+		Stroke(chatBg, Theme.Border, 0.6, 1)
+		
+		-- Custom background (image + dim overlay) sits behind the messages
+		local bgImage = New("ImageLabel", {
+		    Name = "BgImage",
+		    Size = UDim2.new(1, 0, 1, 0),
+		    BackgroundTransparency = 1,
+		    Image = "",
+		    ScaleType = Enum.ScaleType.Crop,
+		    BorderSizePixel = 0,
+		    Visible = false,
+		}, chatBg)
+		Round(bgImage, 12)
+		
+		local bgDim = New("Frame", {
+		    Name = "BgDim",
+		    Size = UDim2.new(1, 0, 1, 0),
+		    BackgroundColor3 = Color3.new(0, 0, 0),
+		    BackgroundTransparency = 1 - BgDim,
+		    BorderSizePixel = 0,
+		    Visible = false,
+		}, chatBg)
+		Round(bgDim, 12)
+		
+		local scroll = New("ScrollingFrame", {
+		    Size = UDim2.new(1, 0, 1, 0),
+		    BackgroundTransparency = 1,
+		    BorderSizePixel = 0,
+		    ScrollBarThickness = 3,
+		    ScrollBarImageColor3 = Theme.Border,
+		    ScrollBarImageTransparency = 0.2,
+		    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		    CanvasSize = UDim2.new(0, 0, 0, 0),
+		}, chatBg)
+		Pad(scroll, 8, 6, 8, 6)
+		
+		New("UIListLayout", {
+		    Padding = UDim.new(0, 0),
+		    SortOrder = Enum.SortOrder.LayoutOrder,
+		}, scroll)
+		
+		local emptyLabel = New("TextLabel", {
+		    Size = UDim2.new(1, 0, 1, 0),
+		    BackgroundTransparency = 1,
+		    Text = "No messages yet. Say hi!",
+		    TextColor3 = Theme.TextFaint,
+		    TextSize = 13,
+		    Font = Enum.Font.GothamMedium,
+		}, chatBg)
+		
+		-- Input area
+		local inputBg = New("Frame", {
+		    Size = UDim2.new(1, -20, 0, 46),
+		    AnchorPoint = Vector2.new(0, 1),
+		    Position = UDim2.new(0, 10, 1, -10),
+		    BackgroundColor3 = Theme.Surface,
+		    BorderSizePixel = 0,
+		}, body)
+		Round(inputBg, 12)
+		local inputStroke = Stroke(inputBg, Theme.Border, 0.4, 1)
+		
+		local inputBox = New("TextBox", {
+		    Size = UDim2.new(1, -96, 0, 34),
+		    AnchorPoint = Vector2.new(0, 0.5),
+		    Position = UDim2.new(0, 14, 0.5, 0),
+		    BackgroundTransparency = 1,
+		    TextColor3 = Theme.Text,
+		    PlaceholderText = "Message the room...",
+		    PlaceholderColor3 = Theme.TextFaint,
+		    Text = "",
+		    TextSize = 14,
+		    Font = Enum.Font.Gotham,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		    ClearTextOnFocus = false,
+		    ClipsDescendants = true,
+		}, inputBg)
+		
+		inputBox.Focused:Connect(function()
+		    Tween(inputStroke, {Color = Theme.Accent, Transparency = 0})
+		end)
+		inputBox.FocusLost:Connect(function()
+		    Tween(inputStroke, {Color = Theme.Border, Transparency = 0.4})
+		end)
+		
+		local sendBtn = New("TextButton", {
+		    Size = UDim2.new(0, 64, 0, 34),
+		    AnchorPoint = Vector2.new(1, 0.5),
+		    Position = UDim2.new(1, -6, 0.5, 0),
+		    BackgroundColor3 = Theme.Accent,
+		    Text = "Send",
+		    TextColor3 = Color3.new(1, 1, 1),
+		    TextSize = 13,
+		    Font = Enum.Font.GothamBold,
+		    AutoButtonColor = false,
+		    BorderSizePixel = 0,
+		}, inputBg)
+		Round(sendBtn, 9)
+		
+		sendBtn.MouseEnter:Connect(function()
+		    Tween(sendBtn, {BackgroundColor3 = Theme.AccentHi})
+		end)
+		sendBtn.MouseLeave:Connect(function()
+		    Tween(sendBtn, {BackgroundColor3 = Theme.Accent})
+		end)
+		
+		-- Settings panel (slides down over the chat) -----------------------------
+		local SETTINGS_H = 352 -- height of the settings content (the panel scrolls if the window is shorter)
+		local ModeButtons = {}
+		
+		local settings = New("Frame", {
+		    Name = "Settings",
+		    Size = UDim2.new(1, -20, 0, 0),
+		    Position = UDim2.new(0, 10, 0, 4),
+		    BackgroundColor3 = Theme.Surface,
+		    BorderSizePixel = 0,
+		    ClipsDescendants = true,
+		    Visible = false,
+		}, body)
+		Round(settings, 12)
+		Stroke(settings, Theme.Border, 0.3, 1)
+		
+		local settingsScroll = New("ScrollingFrame", {
+		    Size = UDim2.new(1, 0, 1, 0),
+		    BackgroundTransparency = 1,
+		    BorderSizePixel = 0,
+		    ScrollBarThickness = 3,
+		    ScrollBarImageColor3 = Theme.Border,
+		    CanvasSize = UDim2.new(0, 0, 0, SETTINGS_H),
+		    ScrollingDirection = Enum.ScrollingDirection.Y,
+		}, settings)
+		
+		local function SettingsHeight()
+		    return math.max(120, math.min(SETTINGS_H, FullH - HEADER_H - 70))
+		end
+		
+		New("TextLabel", {
+		    Size = UDim2.new(1, -28, 0, 14),
+		    Position = UDim2.new(0, 14, 0, 14),
+		    BackgroundTransparency = 1,
+		    Text = "POLLING MODE",
+		    TextColor3 = Theme.TextFaint,
+		    TextSize = 10,
+		    Font = Enum.Font.GothamBold,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		}, settingsScroll)
+		
+		local modeTrack = New("Frame", {
+		    Size = UDim2.new(1, -28, 0, 34),
+		    Position = UDim2.new(0, 14, 0, 32),
+		    BackgroundColor3 = Theme.Bg,
+		    BorderSizePixel = 0,
+		}, settingsScroll)
+		Round(modeTrack, 9)
+		Pad(modeTrack, 3, 3, 3, 3)
+		New("UIListLayout", {
+		    FillDirection = Enum.FillDirection.Horizontal,
+		    Padding = UDim.new(0, 3),
+		    VerticalAlignment = Enum.VerticalAlignment.Center,
+		    SortOrder = Enum.SortOrder.LayoutOrder,
+		}, modeTrack)
+		
+		New("TextLabel", {
+		    Size = UDim2.new(0.5, -14, 0, 18),
+		    Position = UDim2.new(0, 14, 0, 80),
+		    BackgroundTransparency = 1,
+		    Text = "Requests sent",
+		    TextColor3 = Theme.TextDim,
+		    TextSize = 12,
+		    Font = Enum.Font.Gotham,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		}, settingsScroll)
+		
+		local reqCounter = New("TextLabel", {
+		    Size = UDim2.new(0.5, -14, 0, 18),
+		    Position = UDim2.new(0.5, 0, 0, 80),
+		    BackgroundTransparency = 1,
+		    Text = "0",
+		    TextColor3 = Theme.Text,
+		    TextSize = 12,
+		    Font = Enum.Font.GothamBold,
+		    TextXAlignment = Enum.TextXAlignment.Right,
+		}, settingsScroll)
+		
+		local resetBtn = New("TextButton", {
+		    Size = UDim2.new(1, -28, 0, 34),
+		    Position = UDim2.new(0, 14, 0, 108),
+		    BackgroundColor3 = Theme.Bg,
+		    Text = "Reset window size and position",
+		    TextColor3 = Theme.Text,
+		    TextSize = 12,
+		    Font = Enum.Font.GothamMedium,
+		    AutoButtonColor = false,
+		    BorderSizePixel = 0,
+		}, settingsScroll)
+		Round(resetBtn, 9)
+		resetBtn.MouseEnter:Connect(function()
+		    Tween(resetBtn, {BackgroundColor3 = Theme.SurfaceHi})
+		end)
+		resetBtn.MouseLeave:Connect(function()
+		    Tween(resetBtn, {BackgroundColor3 = Theme.Bg})
+		end)
+		resetBtn.MouseButton1Click:Connect(ResetWindow)
+		
+		-- Chat background (image asset ID) ---------------------------------------------
+		New("Frame", {
+		    Size = UDim2.new(1, -28, 0, 1),
+		    Position = UDim2.new(0, 14, 0, 154),
+		    BackgroundColor3 = Theme.Border,
+		    BackgroundTransparency = 0.5,
+		    BorderSizePixel = 0,
+		}, settingsScroll)
+		
+		New("TextLabel", {
+		    Size = UDim2.new(1, -28, 0, 14),
+		    Position = UDim2.new(0, 14, 0, 168),
+		    BackgroundTransparency = 1,
+		    Text = "CHAT BACKGROUND",
+		    TextColor3 = Theme.TextFaint,
+		    TextSize = 10,
+		    Font = Enum.Font.GothamBold,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		}, settingsScroll)
+		
+		local bgInputWrap = New("Frame", {
+		    Size = UDim2.new(1, -28, 0, 34),
+		    Position = UDim2.new(0, 14, 0, 186),
+		    BackgroundColor3 = Theme.Bg,
+		    BorderSizePixel = 0,
+		}, settingsScroll)
+		Round(bgInputWrap, 9)
+		local bgInputStroke = Stroke(bgInputWrap, Theme.Border, 0.4, 1)
+		
+		local bgInput = New("TextBox", {
+		    Size = UDim2.new(1, -24, 1, 0),
+		    Position = UDim2.new(0, 12, 0, 0),
+		    BackgroundTransparency = 1,
+		    Text = BgId,
+		    PlaceholderText = "Image asset ID (e.g. 1234567890)",
+		    PlaceholderColor3 = Theme.TextFaint,
+		    TextColor3 = Theme.Text,
+		    TextSize = 13,
+		    Font = Enum.Font.Gotham,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		    ClearTextOnFocus = false,
+		    ClipsDescendants = true,
+		}, bgInputWrap)
+		
+		bgInput.Focused:Connect(function()
+		    Tween(bgInputStroke, {Color = Theme.Accent, Transparency = 0})
+		end)
+		bgInput.FocusLost:Connect(function()
+		    Tween(bgInputStroke, {Color = Theme.Border, Transparency = 0.4})
+		end)
+		
+		local bgBtnRow = New("Frame", {
+		    Size = UDim2.new(1, -28, 0, 32),
+		    Position = UDim2.new(0, 14, 0, 228),
+		    BackgroundTransparency = 1,
+		}, settingsScroll)
+		
+		local bgApplyBtn = New("TextButton", {
+		    Size = UDim2.new(0.5, -4, 1, 0),
+		    BackgroundColor3 = Theme.Accent,
+		    Text = "Apply",
+		    TextColor3 = Color3.new(1, 1, 1),
+		    TextSize = 12,
+		    Font = Enum.Font.GothamBold,
+		    AutoButtonColor = false,
+		    BorderSizePixel = 0,
+		}, bgBtnRow)
+		Round(bgApplyBtn, 9)
+		bgApplyBtn.MouseEnter:Connect(function()
+		    Tween(bgApplyBtn, {BackgroundColor3 = Theme.AccentHi})
+		end)
+		bgApplyBtn.MouseLeave:Connect(function()
+		    Tween(bgApplyBtn, {BackgroundColor3 = Theme.Accent})
+		end)
+		
+		local bgRemoveBtn = New("TextButton", {
+		    Size = UDim2.new(0.5, -4, 1, 0),
+		    Position = UDim2.new(0.5, 4, 0, 0),
+		    BackgroundColor3 = Theme.Bg,
+		    Text = "Remove",
+		    TextColor3 = Theme.Text,
+		    TextSize = 12,
+		    Font = Enum.Font.GothamMedium,
+		    AutoButtonColor = false,
+		    BorderSizePixel = 0,
+		}, bgBtnRow)
+		Round(bgRemoveBtn, 9)
+		bgRemoveBtn.MouseEnter:Connect(function()
+		    Tween(bgRemoveBtn, {BackgroundColor3 = Theme.SurfaceHi})
+		end)
+		bgRemoveBtn.MouseLeave:Connect(function()
+		    Tween(bgRemoveBtn, {BackgroundColor3 = Theme.Bg})
+		end)
+		
+		local bgStatus = New("TextLabel", {
+		    Size = UDim2.new(1, -28, 0, 28),
+		    Position = UDim2.new(0, 14, 0, 266),
+		    BackgroundTransparency = 1,
+		    Text = "No background set.",
+		    TextColor3 = Theme.TextDim,
+		    TextSize = 11,
+		    Font = Enum.Font.Gotham,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		    TextYAlignment = Enum.TextYAlignment.Top,
+		    TextWrapped = true,
+		}, settingsScroll)
+		
+		New("TextLabel", {
+		    Size = UDim2.new(0.6, -14, 0, 16),
+		    Position = UDim2.new(0, 14, 0, 300),
+		    BackgroundTransparency = 1,
+		    Text = "Background dim",
+		    TextColor3 = Theme.TextDim,
+		    TextSize = 12,
+		    Font = Enum.Font.Gotham,
+		    TextXAlignment = Enum.TextXAlignment.Left,
+		}, settingsScroll)
+		
+		local dimValue = New("TextLabel", {
+		    Size = UDim2.new(0.4, -14, 0, 16),
+		    Position = UDim2.new(0.6, 0, 0, 300),
+		    BackgroundTransparency = 1,
+		    Text = "60%",
+		    TextColor3 = Theme.Text,
+		    TextSize = 12,
+		    Font = Enum.Font.GothamBold,
+		    TextXAlignment = Enum.TextXAlignment.Right,
+		}, settingsScroll)
+		
+		local sliderHolder = New("Frame", {
+		    Size = UDim2.new(1, -28, 0, 22),
+		    Position = UDim2.new(0, 14, 0, 320),
+		    BackgroundTransparency = 1,
+		}, settingsScroll)
+		
+		local dimTrack = New("Frame", {
+		    Size = UDim2.new(1, 0, 0, 6),
+		    AnchorPoint = Vector2.new(0, 0.5),
+		    Position = UDim2.new(0, 0, 0.5, 0),
+		    BackgroundColor3 = Theme.Bg,
+		    BorderSizePixel = 0,
+		}, sliderHolder)
+		Round(dimTrack, 3)
+		
+		local dimFill = New("Frame", {
+		    Size = UDim2.new(0.5, 0, 1, 0),
+		    BackgroundColor3 = Theme.Accent,
+		    BorderSizePixel = 0,
+		}, dimTrack)
+		Round(dimFill, 3)
+		
+		local dimKnob = New("Frame", {
+		    Size = UDim2.new(0, 14, 0, 14),
+		    AnchorPoint = Vector2.new(0.5, 0.5),
+		    Position = UDim2.new(0.5, 0, 0.5, 0),
+		    BackgroundColor3 = Color3.new(1, 1, 1),
+		    BorderSizePixel = 0,
+		}, dimTrack)
+		Round(dimKnob, 7)
+		
+		local MAX_DIM = 0.95
+		
+		local function SetDim(d, save)
+		    BgDim = math.max(0, math.min(MAX_DIM, d))
+		    bgDim.BackgroundTransparency = 1 - BgDim
+		    dimValue.Text = math.floor(BgDim * 100 + 0.5) .. "%"
+		    local f = BgDim / MAX_DIM
+		    dimFill.Size = UDim2.new(f, 0, 1, 0)
+		    dimKnob.Position = UDim2.new(f, 0, 0.5, 0)
+		    if save then SaveSettings() end
+		end
+		
+		do
+		    local dragging = false
+		    local function fromX(x)
+		        local f = math.max(0, math.min(1, (x - dimTrack.AbsolutePosition.X) / math.max(dimTrack.AbsoluteSize.X, 1)))
+		        SetDim(f * MAX_DIM, false)
+		    end
+		    sliderHolder.InputBegan:Connect(function(input)
+		        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		            dragging = true
+		            fromX(input.Position.X)
+		        end
+		    end)
+		    UserInputService.InputChanged:Connect(function(input)
+		        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		            fromX(input.Position.X)
+		        end
+		    end)
+		    UserInputService.InputEnded:Connect(function(input)
+		        if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+		            dragging = false
+		            SaveSettings()
+		        end
+		    end)
+		end
+		
+		local BgToken = 0
+		
+		local function SetBgStatus(text, color)
+		    bgStatus.Text = text
+		    bgStatus.TextColor3 = color or Theme.TextDim
+		end
+		
+		-- Accepts "1234567890", "rbxassetid://1234567890" or a roblox.com link; an empty box removes the background.
+		local function ApplyBackground(raw, userAction)
+		    BgToken = BgToken + 1
+		    local token = BgToken
+		    local id = tostring(raw or ""):match("%d+")
+		
+		    if not id then
+		        bgImage.Visible = false
+		        bgImage.Image = ""
+		        bgDim.Visible = false
+		        bgInput.Text = ""
+		        BgId = ""
+		        SetBgStatus("No background set.")
+		        if userAction then SaveSettings() end
+		        return
+		    end
+		
+		    bgInput.Text = id
+		    SetBgStatus("Loading image...", Theme.Amber)
+		    bgImage.Image = "rbxassetid://" .. id
+		
+		    task.spawn(function()
+		        pcall(function() ContentProvider:PreloadAsync({bgImage}) end)
+		        if token ~= BgToken then return end
+		
+		        if bgImage.IsLoaded then
+		            bgImage.Visible = true
+		            bgDim.Visible = true
+		            BgId = id
+		            SetBgStatus("Background applied.", Theme.Green)
+		            if userAction then SaveSettings() end
+		        else
+		            bgImage.Image = ""
+		            bgImage.Visible = false
+		            bgDim.Visible = false
+		            SetBgStatus("Couldn't load that ID. Use a public Image asset ID (if it's a Decal, try its Image ID).", Theme.Red)
+		        end
+		    end)
+		end
+		
+		bgApplyBtn.MouseButton1Click:Connect(function()
+		    ApplyBackground(bgInput.Text, true)
+		end)
+		bgRemoveBtn.MouseButton1Click:Connect(function()
+		    ApplyBackground("", true)
+		end)
+		bgInput.FocusLost:Connect(function(enterPressed)
+		    if enterPressed then ApplyBackground(bgInput.Text, true) end
+		end)
+		
+		SetDim(BgDim, false)
+		if BgId ~= "" then
+		    ApplyBackground(BgId, false)
+		end
+		
+		local function SetMode(mode)
+		    ManualMode = mode
+		    for name, btn in pairs(ModeButtons) do
+		        if name == mode then
+		            Tween(btn, {BackgroundTransparency = 0, TextColor3 = Color3.new(1, 1, 1)})
+		        else
+		            Tween(btn, {BackgroundTransparency = 1, TextColor3 = Theme.TextDim})
+		        end
+		    end
+		
+		    if mode == "active" then
+		        CurrentPollInterval = 2
+		        statusLabel.Text = "Active (2s)"
+		        statusDot.BackgroundColor3 = Theme.Green
+		        ForcePoll = true
+		    elseif mode == "inactive" then
+		        statusLabel.Text = "Inactive"
+		        statusDot.BackgroundColor3 = Theme.Red
+		    else
+		        CurrentPollInterval = POLL_IDLE
+		        statusLabel.Text = "Idle"
+		        statusDot.BackgroundColor3 = Theme.Gray
+		    end
+		end
+		
+		for idx, mode in ipairs({"active", "idle", "inactive"}) do
+		    local btn = New("TextButton", {
+		        Size = UDim2.new(1 / 3, -2, 1, 0),
+		        BackgroundColor3 = Theme.Accent,
+		        BackgroundTransparency = 1,
+		        Text = mode:sub(1, 1):upper() .. mode:sub(2),
+		        TextColor3 = Theme.TextDim,
+		        TextSize = 12,
+		        Font = Enum.Font.GothamMedium,
+		        AutoButtonColor = false,
+		        BorderSizePixel = 0,
+		        LayoutOrder = idx,
+		    }, modeTrack)
+		    Round(btn, 7)
+		    btn.MouseButton1Click:Connect(function()
+		        SetMode(mode)
+		    end)
+		    ModeButtons[mode] = btn
+		end
+		
+		SetMode("inactive")
+		
+		-- Resize grip (bottom-right corner) ----------------------------------------
+		local grip = New("TextButton", {
+		    Size = UDim2.new(0, 16, 0, 16),
+		    AnchorPoint = Vector2.new(1, 1),
+		    Position = UDim2.new(1, 0, 1, 0),
+		    BackgroundTransparency = 1,
+		    Text = "",
+		    AutoButtonColor = false,
+		}, body)
+		local gripBars = {
+		    Bar(grip, 12, 2, -45, 1, 1),
+		    Bar(grip, 6, 2, -45, 4, 4),
+		}
+		for _, b in ipairs(gripBars) do b.BackgroundColor3 = Theme.TextFaint end
+		
+		grip.MouseEnter:Connect(function()
+		    for _, b in ipairs(gripBars) do Tween(b, {BackgroundColor3 = Theme.AccentSoft}) end
+		end)
+		grip.MouseLeave:Connect(function()
+		    for _, b in ipairs(gripBars) do Tween(b, {BackgroundColor3 = Theme.TextFaint}) end
+		end)
+		
+		do
+		    local resizing = false
+		    local startMouse, startW, startH
+		    grip.InputBegan:Connect(function(input)
+		        if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch)
+		            and not minimized then
+		            resizing = true
+		            startMouse = input.Position
+		            startW, startH = FullW, FullH
+		            input.Changed:Connect(function()
+		                if input.UserInputState == Enum.UserInputState.End then
+		                    resizing = false
+		                    SaveSettings()
+		                end
+		            end)
+		        end
+		    end)
+		    UserInputService.InputChanged:Connect(function(input)
+		        if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		            local d = input.Position - startMouse
+		            FullW = math.max(MIN_W, math.min(MAX_W, startW + d.X))
+		            FullH = math.max(MIN_HGT, math.min(MAX_HGT, startH + d.Y))
+		            ApplySize()
+		            if SettingsOpen then
+		                settings.Size = UDim2.new(1, -20, 0, SettingsHeight())
+		            end
+		        end
+		    end)
+		end
+		
+		-- Show / hide / minimize / settings -------------------------------------------
+		local AnimToken, MinToken = 0, 0
+		
+		SetSettingsOpen = function(state)
+		    SettingsOpen = state
+		    Tween(gearBtn, {BackgroundColor3 = state and Theme.SurfaceHi or Theme.Surface})
+		    for _, b in ipairs(gearBars) do
+		        Tween(b, {BackgroundColor3 = state and Theme.AccentSoft or Theme.TextDim})
+		    end
+		    if state then
+		        settings.Visible = true
+		        settings.Size = UDim2.new(1, -20, 0, 0)
+		        Tween(settings, {Size = UDim2.new(1, -20, 0, SettingsHeight())}, 0.2)
+		    else
+		        Tween(settings, {Size = UDim2.new(1, -20, 0, 0)}, 0.15)
+		        task.delay(0.16, function()
+		            if not SettingsOpen then settings.Visible = false end
+		        end)
+		    end
+		end
+		
+		ShowUI = function(skipPoll)
+		    AnimToken = AnimToken + 1
+		    visible = true
+		    sg.Enabled = true
+		    frameScale.Scale = 0.95
+		    frame.GroupTransparency = 1
+		    frameStroke.Transparency = 1
+		    Tween(frame, {GroupTransparency = 0}, 0.22)
+		    Tween(frameStroke, {Transparency = 0.2}, 0.22)
+		    Tween(frameScale, {Scale = 1}, 0.3, Enum.EasingStyle.Back)
+		    if not skipPoll then
+		        ForcePoll = true -- polling was paused while hidden, so catch up right away
+		    end
+		end
+		
+		HideUI = function()
+		    AnimToken = AnimToken + 1
+		    local token = AnimToken
+		    visible = false -- polling stops immediately
+		    inputBox:ReleaseFocus()
+		    Tween(frame, {GroupTransparency = 1}, 0.16)
+		    Tween(frameStroke, {Transparency = 1}, 0.16)
+		    Tween(frameScale, {Scale = 0.96}, 0.16)
+		    task.delay(0.18, function()
+		        if AnimToken == token then
+		            sg.Enabled = false
+		        end
+		    end)
+		end
+		
+		ToggleUI = function()
+		    ChatApi.SetEnabled(not visible)
+		end
+		
+		SetMinimized = function(state)
+		    minimized = state -- polling pauses while minimized (see CanPoll)
+		    MinToken = MinToken + 1
+		    local token = MinToken
+		    Tween(minBarV, {BackgroundTransparency = state and 0 or 1}, 0.15)
+		
+		    if state then
+		        SetSettingsOpen(false)
+		        inputBox:ReleaseFocus()
+		        statusLabel.Text = "Paused (minimized)"
+		        statusLabel.TextColor3 = Theme.TextDim
+		        statusDot.BackgroundColor3 = Theme.TextFaint
+		        Tween(frame, {Size = UDim2.new(0, FullW, 0, HEADER_H)}, 0.22)
+		        task.delay(0.22, function()
+		            if MinToken == token then body.Visible = false end
+		        end)
+		    else
+		        statusLabel.Text = "Resuming..."
+		        statusLabel.TextColor3 = Theme.TextDim
+		        statusDot.BackgroundColor3 = Theme.Blue
+		        ForcePoll = true -- catch up right away, then normal polling resumes
+		        body.Visible = true
+		        Tween(frame, {Size = UDim2.new(0, FullW, 0, FullH)}, 0.25)
+		        task.delay(0.1, function()
+		            scroll.CanvasPosition = Vector2.new(0, scroll.AbsoluteCanvasSize.Y)
+		        end)
+		    end
+		end
+		
+		UserInputService.InputBegan:Connect(function(input, gp)
+		    if not gp and input.KeyCode == Enum.KeyCode.RightShift then
+		        ToggleUI()
+		    end
+		end)
+		
+		-- Opening animation on first load (init does its own fetch, so no extra poll)
+		sg.Enabled = false -- hidden until the Chat Room toggle is switched on
+		
+		-- Make sure a remembered size/position still fits the current screen
+		task.delay(0.3, function()
+		    local cam = game:GetService("Workspace").CurrentCamera
+		    if not cam then return end
+		    local vp = cam.ViewportSize
+		    FullW = math.min(FullW, math.max(MIN_W, vp.X - 40))
+		    FullH = math.min(FullH, math.max(MIN_HGT, vp.Y - 80))
+		    ApplySize()
+		    local pos, size = frame.AbsolutePosition, frame.AbsoluteSize
+		    if pos.X > vp.X - 80 or pos.Y > vp.Y - 80 or pos.X + size.X < 80 or pos.Y + size.Y < 80 then
+		        ResetWindow()
+		    end
+		end)
+		
+		--// Activity tracking
+		local function MarkActive()
+		    LastActivityTime = tick()
+		    CurrentPollInterval = POLL_ACTIVE
+		end
+		
+		inputBox.Focused:Connect(MarkActive)
+		inputBox:GetPropertyChangedSignal("Text"):Connect(MarkActive)
+		inputBox:GetPropertyChangedSignal("Text"):Connect(function()
+		    if #inputBox.Text > MAX_MESSAGE_LENGTH then
+		        inputBox.Text = inputBox.Text:sub(1, MAX_MESSAGE_LENGTH)
+		    end
+		end)
+		sendBtn.MouseButton1Click:Connect(MarkActive)
+		
+		--// Message display (compact rows, consecutive messages from one sender are grouped)
+		local NamePalette = {
+		    Color3.fromRGB(196, 181, 253),
+		    Color3.fromRGB(110, 231, 183),
+		    Color3.fromRGB(252, 165, 165),
+		    Color3.fromRGB(253, 224, 71),
+		    Color3.fromRGB(147, 197, 253),
+		    Color3.fromRGB(240, 171, 252),
+		    Color3.fromRGB(253, 186, 116),
+		    Color3.fromRGB(94, 234, 212),
+		}
+		
+		local function NameColor(name)
+		    local sum = 0
+		    for i = 1, #name do
+		        sum = sum + name:byte(i) * i
+		    end
+		    return NamePalette[(sum % #NamePalette) + 1]
+		end
+		
+		--// Filtering + spam protection
+		local LastSentText, LastSentAt = nil, 0
+		
+		local FILTER_SUFFIXES = {"", "s", "es", "ed", "er", "ers", "ing", "in", "y"}
+		local LEET = {["0"] = "o", ["1"] = "i", ["3"] = "e", ["4"] = "a", ["5"] = "s", ["7"] = "t", ["@"] = "a", ["$"] = "s"}
+		
+		local function EscapePattern(str)
+		    return (str:gsub("%p", "%%%0"))
+		end
+		
+		-- lowercase + undo common leetspeak (same length as the input, so positions line up)
+		local function Normalize(str)
+		    return (str:lower():gsub("[013457@%$]", LEET))
+		end
+		
+		-- Masks blocked words/phrases with asterisks. Returns the masked text and whether anything matched.
+		local function FilterText(text)
+		    local norm = Normalize(text)
+		    local out, found = text, false
+		
+		    local function mask(st, en)
+		        local stars = string.rep("*", en - st + 1)
+		        out = out:sub(1, st - 1) .. stars .. out:sub(en + 1)
+		        norm = norm:sub(1, st - 1) .. stars .. norm:sub(en + 1)
+		        found = true
+		    end
+		
+		    for _, word in ipairs(BLOCKED_WORDS) do
+		        local base = EscapePattern(Normalize(word))
+		        for _, suffix in ipairs(FILTER_SUFFIXES) do
+		            local pat = "%f[%a]" .. base .. suffix .. "%f[%A]"
+		            local init = 1
+		            while true do
+		                local st, en = norm:find(pat, init)
+		                if not st then break end
+		                mask(st, en)
+		                init = en + 1
+		            end
+		        end
+		    end
+		
+		    for _, phrase in ipairs(BLOCKED_PHRASES) do
+		        local p = Normalize(phrase)
+		        local init = 1
+		        while true do
+		            local st, en = norm:find(p, init, true)
+		            if not st then break end
+		            mask(st, en)
+		            init = en + 1
+		        end
+		    end
+		
+		    return out, found
+		end
+		
+		-- Limits runs of the same character ("aaaaaaaa" -> "aaaa")
+		local function CollapseRepeats(str, maxRun)
+		    local out, last, run = {}, nil, 0
+		    for i = 1, #str do
+		        local c = str:sub(i, i)
+		        if c == last then
+		            run = run + 1
+		        else
+		            last, run = c, 1
+		        end
+		        if run <= maxRun then
+		            out[#out + 1] = c
+		        end
+		    end
+		    return table.concat(out)
+		end
+		
+		-- Tidies an outgoing message: strips control characters, collapses spaces/repeats, trims, caps length
+		local function CleanMessage(text)
+		    text = text:gsub("%c", " ")
+		    text = text:gsub("%s+", " ")
+		    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+		    text = CollapseRepeats(text, MAX_REPEAT_RUN)
+		    return text:sub(1, MAX_MESSAGE_LENGTH)
+		end
+		
+		local MsgCounter = 0
+		local ScrollQueued = false
+		
+		-- Dates / times
+		local function DayKey(ts)
+		    local d = os.date("*t", ts)
+		    return d.year * 1000 + d.yday
+		end
+		
+		local function FormatClock(ts)
+		    return (os.date("%I:%M %p", ts):gsub("^0", ""))
+		end
+		
+		local function FormatStamp(ts)
+		    local now = os.time()
+		    local k = DayKey(ts)
+		    if k == DayKey(now) then
+		        return "Today at " .. FormatClock(ts)
+		    elseif k == DayKey(now - 86400) then
+		        return "Yesterday at " .. FormatClock(ts)
+		    end
+		    return os.date("%m/%d/%Y", ts) .. "  " .. FormatClock(ts)
+		end
+		
+		local function FormatDay(ts)
+		    local now = os.time()
+		    local k = DayKey(ts)
+		    if k == DayKey(now) then return "Today" end
+		    if k == DayKey(now - 86400) then return "Yesterday" end
+		    return os.date("%B %d, %Y", ts)
+		end
+		
+		-- Avatar headshots (cached; falls back to a colored initial until they load)
+		local Avatars = {}
+		
+		local function FetchAvatar(name, userId, callback)
+		    local key = userId or name
+		    local e = Avatars[key]
+		    if e then
+		        if e.done then
+		            if e.url then callback(e.url) end
+		        else
+		            table.insert(e.waiters, callback)
+		        end
+		        return
+		    end
+		
+		    e = {done = false, waiters = {callback}}
+		    Avatars[key] = e
+		
+		    task.spawn(function()
+		        local id = userId
+		        if not id then
+		            local ok, res = pcall(Players.GetUserIdFromNameAsync, Players, name)
+		            if ok then id = res end
+		        end
+		        if id then
+		            local ok2, url = pcall(Players.GetUserThumbnailAsync, Players, id, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+		            if ok2 then e.url = url end
+		        end
+		        e.done = true
+		        local waiters = e.waiters
+		        e.waiters = {}
+		        if e.url then
+		            for _, w in ipairs(waiters) do pcall(w, e.url) end
+		        end
+		    end)
+		end
+		
+		-- Scroll to the newest message (debounced so loading history doesn't stall)
+		local function QueueScroll()
+		    if ScrollQueued then return end
+		    ScrollQueued = true
+		    task.delay(0.06, function()
+		        ScrollQueued = false
+		        scroll.CanvasPosition = Vector2.new(0, scroll.AbsoluteCanvasSize.Y)
+		    end)
+		end
+		
+		local function AddMessage(sender, text, timestamp, isLocal, userId)
+		    if isLocal then userId = LocalPlayer.UserId end
+		    if FILTER_INCOMING then text = FilterText(text) end
+		
+		    -- only auto-scroll if the reader is already at the bottom (or it's their own message)
+		    local nearBottom = (scroll.AbsoluteCanvasSize.Y - scroll.CanvasPosition.Y - scroll.AbsoluteWindowSize.Y) < 60
+		    emptyLabel.Visible = false
+		
+		    local prev = ChatHistory[#ChatHistory]
+		    local newDay = prev == nil or DayKey(prev.time) ~= DayKey(timestamp)
+		    local grouped = not newDay and prev.sender == sender and math.abs(timestamp - prev.time) <= GROUP_WINDOW
+		    local frames = {}
+		
+		    -- date divider
+		    if newDay then
+		        MsgCounter = MsgCounter + 1
+		        local divider = New("Frame", {
+		            Size = UDim2.new(1, 0, 0, 30),
+		            BackgroundTransparency = 1,
+		            LayoutOrder = MsgCounter,
+		        }, scroll)
+		        New("Frame", {
+		            Size = UDim2.new(1, -16, 0, 1),
+		            AnchorPoint = Vector2.new(0, 0.5),
+		            Position = UDim2.new(0, 8, 0.5, 0),
+		            BackgroundColor3 = Theme.Border,
+		            BackgroundTransparency = 0.3,
+		            BorderSizePixel = 0,
+		        }, divider)
+		        local dayPill = New("TextLabel", {
+		            AnchorPoint = Vector2.new(0.5, 0.5),
+		            Position = UDim2.new(0.5, 0, 0.5, 0),
+		            Size = UDim2.new(0, 0, 0, 18),
+		            AutomaticSize = Enum.AutomaticSize.X,
+		            BackgroundColor3 = Theme.Surface,
+		            BorderSizePixel = 0,
+		            Text = FormatDay(timestamp),
+		            TextColor3 = Theme.TextDim,
+		            TextSize = 11,
+		            Font = Enum.Font.GothamBold,
+		        }, divider)
+		        Round(dayPill, 9)
+		        Pad(dayPill, 0, 10, 0, 10)
+		        table.insert(frames, divider)
+		    end
+		
+		    MsgCounter = MsgCounter + 1
+		    local row = New("Frame", {
+		        Size = UDim2.new(1, 0, 0, 0),
+		        AutomaticSize = Enum.AutomaticSize.Y,
+		        BackgroundColor3 = Theme.SurfaceHi,
+		        BackgroundTransparency = 1,
+		        BorderSizePixel = 0,
+		        LayoutOrder = MsgCounter,
+		    }, scroll)
+		    Round(row, 6)
+		    Pad(row, grouped and 1 or 8, 8, 1, 8)
+		    table.insert(frames, row)
+		
+		    row.MouseEnter:Connect(function()
+		        Tween(row, {BackgroundTransparency = 0.6}, 0.1)
+		    end)
+		    row.MouseLeave:Connect(function()
+		        Tween(row, {BackgroundTransparency = 1}, 0.1)
+		    end)
+		
+		    -- message content sits to the right of the avatar column
+		    local content = New("Frame", {
+		        Position = UDim2.new(0, 44, 0, 0),
+		        Size = UDim2.new(1, -44, 0, 0),
+		        AutomaticSize = Enum.AutomaticSize.Y,
+		        BackgroundTransparency = 1,
+		    }, row)
+		    New("UIListLayout", {
+		        FillDirection = Enum.FillDirection.Vertical,
+		        Padding = UDim.new(0, 2),
+		        SortOrder = Enum.SortOrder.LayoutOrder,
+		    }, content)
+		
+		    if not grouped then
+		        local nameColor = NameColor(sender)
+		
+		        local avatar = New("Frame", {
+		            Size = UDim2.new(0, 34, 0, 34),
+		            BackgroundColor3 = nameColor:Lerp(Theme.Bg, 0.65),
+		            BorderSizePixel = 0,
+		        }, row)
+		        Round(avatar, 17)
+		        New("TextLabel", {
+		            Size = UDim2.new(1, 0, 1, 0),
+		            BackgroundTransparency = 1,
+		            Text = sender:sub(1, 1):upper(),
+		            TextColor3 = nameColor,
+		            TextSize = 15,
+		            Font = Enum.Font.GothamBold,
+		        }, avatar)
+		        local pic = New("ImageLabel", {
+		            Size = UDim2.new(1, 0, 1, 0),
+		            BackgroundTransparency = 1,
+		            ImageTransparency = 1,
+		            ScaleType = Enum.ScaleType.Crop,
+		            BorderSizePixel = 0,
+		        }, avatar)
+		        Round(pic, 17)
+		        FetchAvatar(sender, userId, function(url)
+		            if pic.Parent then
+		                pic.Image = url
+		                Tween(pic, {ImageTransparency = 0}, 0.2)
+		            end
+		        end)
+		
+		        local header = New("Frame", {
+		            Size = UDim2.new(1, 0, 0, 18),
+		            BackgroundTransparency = 1,
+		            LayoutOrder = 1,
+		        }, content)
+		        New("UIListLayout", {
+		            FillDirection = Enum.FillDirection.Horizontal,
+		            Padding = UDim.new(0, 8),
+		            VerticalAlignment = Enum.VerticalAlignment.Center,
+		            SortOrder = Enum.SortOrder.LayoutOrder,
+		        }, header)
+		        New("TextLabel", {
+		            Size = UDim2.new(0, 0, 1, 0),
+		            AutomaticSize = Enum.AutomaticSize.X,
+		            BackgroundTransparency = 1,
+		            Text = sender,
+		            TextColor3 = isLocal and Theme.AccentSoft or nameColor,
+		            TextSize = 13,
+		            Font = Enum.Font.GothamBold,
+		            TextXAlignment = Enum.TextXAlignment.Left,
+		            LayoutOrder = 1,
+		        }, header)
+		        New("TextLabel", {
+		            Size = UDim2.new(0, 0, 1, 0),
+		            AutomaticSize = Enum.AutomaticSize.X,
+		            BackgroundTransparency = 1,
+		            Text = FormatStamp(timestamp),
+		            TextColor3 = Theme.TextFaint,
+		            TextSize = 11,
+		            Font = Enum.Font.Gotham,
+		            TextXAlignment = Enum.TextXAlignment.Left,
+		            LayoutOrder = 2,
+		        }, header)
+		    end
+		
+		    local richText, links = BuildRich(text, false)
+		    local hasLinks = #links > 0
+		
+		    New("TextLabel", {
+		        Size = UDim2.new(1, 0, 0, 0),
+		        AutomaticSize = Enum.AutomaticSize.Y,
+		        BackgroundTransparency = 1,
+		        TextColor3 = Theme.Text,
+		        RichText = hasLinks,
+		        Text = hasLinks and richText or text,
+		        TextSize = 14,
+		        Font = Enum.Font.Gotham,
+		        TextXAlignment = Enum.TextXAlignment.Left,
+		        TextYAlignment = Enum.TextYAlignment.Top,
+		        TextWrapped = true,
+		        LayoutOrder = 2,
+		    }, content)
+		
+		    if hasLinks then
+		        local linkBox = New("Frame", {
+		            Size = UDim2.new(0, 0, 0, 0),
+		            AutomaticSize = Enum.AutomaticSize.XY,
+		            BackgroundTransparency = 1,
+		            LayoutOrder = 3,
+		        }, content)
+		        New("UIListLayout", {
+		            Padding = UDim.new(0, 5),
+		            SortOrder = Enum.SortOrder.LayoutOrder,
+		            HorizontalAlignment = Enum.HorizontalAlignment.Left,
+		        }, linkBox)
+		
+		        for i = 1, math.min(#links, 3) do
+		            local url = links[i]
+		            local linkBtn = New("TextButton", {
+		                Size = UDim2.new(0, 0, 0, 26),
+		                AutomaticSize = Enum.AutomaticSize.X,
+		                BackgroundColor3 = Theme.Bg,
+		                Text = "Copy  " .. ShortenUrl(url),
+		                TextColor3 = Theme.AccentSoft,
+		                TextSize = 12,
+		                Font = Enum.Font.GothamMedium,
+		                TextTruncate = Enum.TextTruncate.AtEnd,
+		                AutoButtonColor = false,
+		                BorderSizePixel = 0,
+		                LayoutOrder = i,
+		            }, linkBox)
+		            Round(linkBtn, 8)
+		            Pad(linkBtn, 0, 12, 0, 12)
+		            New("UISizeConstraint", {MaxSize = Vector2.new(300, 26)}, linkBtn)
+		
+		            linkBtn.MouseEnter:Connect(function()
+		                Tween(linkBtn, {BackgroundColor3 = Theme.SurfaceHi})
+		            end)
+		            linkBtn.MouseLeave:Connect(function()
+		                Tween(linkBtn, {BackgroundColor3 = Theme.Bg})
+		            end)
+		            linkBtn.MouseButton1Click:Connect(function()
+		                CopyLink(url, linkBtn)
+		            end)
+		        end
+		    end
+		
+		    table.insert(ChatHistory, {sender = sender, text = text, time = timestamp, frames = frames})
+		
+		    while #ChatHistory > MAX_MESSAGES do
+		        local old = table.remove(ChatHistory, 1)
+		        for _, f in ipairs(old.frames or {}) do
+		            f:Destroy()
+		        end
+		    end
+		
+		    if nearBottom or isLocal then
+		        QueueScroll()
+		    end
+		end
+		
+		--// Core poll
+		local function ProcessMessages()
+		    if not CanPoll() then return false end -- hidden or minimized: never hit the network
+		
+		    local timeSinceLastPoll = tick() - LastPollTime
+		    if timeSinceLastPoll < MIN_POLL_GAP then
+		        task.wait(MIN_POLL_GAP - timeSinceLastPoll)
+		        if not CanPoll() then return false end
+		    end
+		
+		    RequestCount = RequestCount + 1
+		    reqCounter.Text = tostring(RequestCount)
+		    LastPollTime = tick()
+		
+		    local messages = FetchMessages(LastMessageId)
+		
+		    if not messages then
+		        return false
+		    end
+		
+		    local newMessages = 0
+		
+		    for _, msg in ipairs(messages) do
+		        if msg.id and msg.username and msg.message and msg.timestamp then
+		            LastMessageId = math.max(LastMessageId, msg.id)
+		            -- our own messages are already on screen from SendMessage
+		            if msg.username ~= USERNAME then
+		                AddMessage(msg.username, msg.message, msg.timestamp, false, tonumber(msg.userId))
+		                newMessages = newMessages + 1
+		            end
+		        end
+		    end
+		
+		    -- a full page came back, so there may be more waiting: fetch again right away
+		    if #messages >= 100 then
+		        ForcePoll = true
+		    end
+		
+		    if ManualMode == "active" then
+		        CurrentPollInterval = 2
+		        statusLabel.Text = "Active (2s)"
+		        statusDot.BackgroundColor3 = Theme.Green
+		    elseif ManualMode == "inactive" then
+		        statusLabel.Text = "Inactive"
+		        statusDot.BackgroundColor3 = Theme.Red
+		    else
+		        local timeSinceActivity = tick() - LastActivityTime
+		        if newMessages > 0 then
+		            CurrentPollInterval = POLL_BURST
+		            LastActivityTime = tick()
+		            statusLabel.Text = "Live"
+		            statusDot.BackgroundColor3 = Theme.Green
+		        elseif timeSinceActivity < ACTIVE_DURATION then
+		            CurrentPollInterval = POLL_ACTIVE
+		            statusLabel.Text = "Active"
+		            statusDot.BackgroundColor3 = Theme.Blue
+		        else
+		            CurrentPollInterval = POLL_IDLE
+		            statusLabel.Text = "Idle"
+		            statusDot.BackgroundColor3 = Theme.Gray
+		        end
+		    end
+		    statusLabel.TextColor3 = Theme.TextDim
+		
+		    return true
+		end
+		
+		--// Poll thread
+		-- Smart polling: while the UI is hidden OR minimized this loop makes zero requests and just sleeps.
+		-- Showing / expanding the UI forces an immediate catch-up poll, then normal polling resumes.
+		local function PollMessages()
+		    PollGen = PollGen + 1
+		    local myGen = PollGen -- a newer loop (from the watchdog) retires this one
+		
+		    while myGen == PollGen do
+		        if not CanPoll() then
+		            task.wait(0.5)
+		        else
+		            local waited = 0
+		            while myGen == PollGen and CanPoll() and not ForcePoll
+		                and ManualMode ~= "inactive" and waited < CurrentPollInterval do
+		                task.wait(0.5)
+		                waited = waited + 0.5
+		            end
+		
+		            if myGen ~= PollGen then break end
+		
+		            if CanPoll() and (ForcePoll or ManualMode ~= "inactive") then
+		                ForcePoll = false
+		                local ok, err = pcall(ProcessMessages)
+		                if not ok then
+		                    print("[Chat] Poll error: " .. tostring(err))
+		                    task.wait(5)
+		                end
+		            else
+		                task.wait(0.5) -- inactive mode: wait for a manual refresh
+		            end
+		        end
+		    end
+		end
+		
+		--// Send message
+		local function SendMessage(text)
+		    if IsSending or text:match("^%s*$") then return end
+		
+		    -- spam block: one message per SEND_COOLDOWN seconds
+		    local timeSinceLast = tick() - LastSendTime
+		    if timeSinceLast < SEND_COOLDOWN then
+		        statusLabel.Text = string.format("Wait %.1fs", SEND_COOLDOWN - timeSinceLast)
+		        statusLabel.TextColor3 = Theme.Amber
+		        return
+		    end
+		
+		    text = CleanMessage(text)
+		    if text == "" then return end
+		
+		    -- filter: blocked words / scam links are not sent (text stays in the box so it can be edited)
+		    local _, blocked = FilterText(text)
+		    if blocked then
+		        statusLabel.Text = "Message blocked"
+		        statusLabel.TextColor3 = Theme.Amber
+		        return
+		    end
+		
+		    -- same message twice in a row
+		    if text == LastSentText and tick() - LastSentAt < DUPLICATE_WINDOW then
+		        statusLabel.Text = "Duplicate message"
+		        statusLabel.TextColor3 = Theme.Amber
+		        return
+		    end
+		
+		    IsSending = true
+		    LastSendTime = tick()
+		    LastActivityTime = tick()
+		    CurrentPollInterval = POLL_BURST
+		    statusLabel.Text = "Sending..."
+		    statusLabel.TextColor3 = Theme.TextDim
+		
+		    local saved, status = PostMessage(text)
+		
+		    if saved then
+		        LastSentText, LastSentAt = text, tick()
+		        AddMessage(USERNAME, text, saved.timestamp or os.time(), true)
+		        inputBox.Text = ""
+		        statusLabel.Text = "Sent"
+		        statusLabel.TextColor3 = Theme.Green
+		        ForcePoll = true
+		    elseif status == 429 then
+		        statusLabel.Text = "Slow down"
+		        statusLabel.TextColor3 = Theme.Amber
+		    elseif status == 401 then
+		        statusLabel.Text = "Bad chat key"
+		        statusLabel.TextColor3 = Theme.Red
+		    else
+		        statusLabel.Text = "Failed"
+		        statusLabel.TextColor3 = Theme.Red
+		    end
+		
+		    LastSendTime = tick() -- cooldown counts from when the send finished, not when it started
+		    IsSending = false
+		end
+		
+		--// Button handlers
+		sendBtn.MouseButton1Click:Connect(function()
+		    SendMessage(inputBox.Text)
+		end)
+		
+		inputBox.FocusLost:Connect(function(enterPressed)
+		    if enterPressed then
+		        SendMessage(inputBox.Text)
+		    end
+		end)
+		
+		--// Init
+		task.spawn(function()
+		    local hasHttp = DetectRequest()
+		
+		    if not hasHttp then
+		        statusLabel.Text = "No HTTP"
+		        statusLabel.TextColor3 = Theme.Red
+		        return
+		    end
+		
+		    statusLabel.Text = "Loading..."
+		
+		    local history = FetchMessages(0)
+		
+		    if history ~= nil then
+		        statusLabel.Text = "Idle"
+		
+		        for _, msg in ipairs(history) do
+		            if msg.id and msg.username and msg.message and msg.timestamp then
+		                AddMessage(msg.username, msg.message, msg.timestamp, msg.username == USERNAME, tonumber(msg.userId))
+		                LastMessageId = math.max(LastMessageId, msg.id)
+		            end
+		        end
+		
+		        task.spawn(PollMessages)
+		
+		        task.spawn(function()
+		            while true do
+		                task.wait(30)
+		                if CanPoll() and ManualMode ~= "inactive"
+		                    and tick() - LastPollTime > math.max(CurrentPollInterval * 3, 120) then
+		                    task.spawn(PollMessages) -- bumps PollGen, old loop exits
+		                end
+		            end
+		        end)
+		    else
+		        statusLabel.Text = "Failed"
+		        statusLabel.TextColor3 = Theme.Red
+		    end
+		end)
+		
+		print("Chat v16 loaded - RightShift toggles the UI, use the menu button for settings.")
+		
+		local LastActiveMode = "idle"
+		function ChatApi.SetEnabled(state)
+		    if state == visible then return end
+		    if state then
+		        SetMode(LastActiveMode)
+		        ShowUI()
+		    else
+		        if ManualMode ~= "inactive" then LastActiveMode = ManualMode end
+		        HideUI()
+		        SetMode("inactive")
+		    end
+		    if ChatApi.OnChanged then ChatApi.OnChanged(state) end
+		end
+		function ChatApi.IsEnabled() return visible end
+		
+		return ChatApi
+	end
+
+	local ChatRoom = CreateChatRoom()
+	local section = v2:Tab({ Title = "Chat Room", Icon = "message-circle" }):Section({ Title = "Chat Room" })
+	local control
+	control = section:Toggle({
+		Title = "Chat Room",
+		Desc = "On: chat window is shown and usable. Off: hidden and status set to inactive.",
+		Default = false,
+		Callback = function(state)
+			ChatRoom.SetEnabled(state == true)
+		end,
+	})
+	-- keeps the toggle in sync when the chat is closed with its X button or RightShift
+	ChatRoom.OnChanged = function(state)
+		if control then pcall(function() control:Set(state, true) end) end
+	end
+end
